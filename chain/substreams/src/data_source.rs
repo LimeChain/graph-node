@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{collections::HashSet, sync::Arc};
 
 use anyhow::{anyhow, Error};
 use graph::{
@@ -7,10 +7,6 @@ use graph::{
     components::link_resolver::LinkResolver,
     prelude::{async_trait, BlockNumber, DataSourceTemplateInfo, Link},
     slog::Logger,
-    substreams::{
-        module::input::{Input, Params},
-        Module,
-    },
 };
 
 use prost::Message;
@@ -24,7 +20,7 @@ const DYNAMIC_DATA_SOURCE_ERROR: &str = "Substreams do not support dynamic data 
 const TEMPLATE_ERROR: &str = "Substreams do not support templates";
 
 const ALLOWED_MAPPING_KIND: [&str; 1] = ["substreams/graph-entities"];
-
+const SUBSTREAMS_HANDLER_KIND: &str = "substreams";
 #[derive(Clone, Debug, PartialEq)]
 /// Represents the DataSource portion of the manifest once it has been parsed
 /// and the substream spkg has been downloaded + parsed.
@@ -78,6 +74,11 @@ impl blockchain::DataSource<Chain> for DataSource {
     // runtime is not needed for substreams, it will cause the host creation to be skipped.
     fn runtime(&self) -> Option<Arc<Vec<u8>>> {
         None
+    }
+
+    fn handler_kinds(&self) -> HashSet<&str> {
+        // This is placeholder, substreams do not have a handler kind.
+        vec![SUBSTREAMS_HANDLER_KIND].into_iter().collect()
     }
 
     // match_and_decode only seems to be used on the default trigger processor which substreams
@@ -156,35 +157,6 @@ pub struct UnresolvedDataSource {
     pub mapping: UnresolvedMapping,
 }
 
-/// Replace all the existing params with the provided ones.
-fn patch_module_params(params: Option<Vec<String>>, module: &mut Module) {
-    let params = match params {
-        Some(params) => params,
-        None => return,
-    };
-
-    let mut inputs: Vec<graph::substreams::module::Input> = module
-        .inputs
-        .iter()
-        .flat_map(|input| match input.input {
-            None => None,
-            Some(Input::Params(_)) => None,
-            Some(_) => Some(input.clone()),
-        })
-        .collect();
-
-    inputs.append(
-        &mut params
-            .into_iter()
-            .map(|value| graph::substreams::module::Input {
-                input: Some(Input::Params(Params { value })),
-            })
-            .collect(),
-    );
-
-    module.inputs = inputs;
-}
-
 #[derive(Clone, Debug, Default, Hash, Eq, PartialEq, Deserialize)]
 #[serde(rename_all = "camelCase")]
 /// Text api_version, before parsing and validation.
@@ -211,7 +183,9 @@ impl blockchain::UnresolvedDataSource<Chain> for UnresolvedDataSource {
                 .iter_mut()
                 .find(|module| module.name == self.source.package.module_name)
                 .map(|module| {
-                    patch_module_params(self.source.package.params, module);
+                    if let Some(params) = self.source.package.params {
+                        graph::substreams::patch_module_params(params.join("\n"), module);
+                    }
                     module
                 }),
             None => None,
@@ -410,19 +384,11 @@ mod test {
         let mut package = gen_package();
         let mut modules = package.modules.unwrap();
         modules.modules.get_mut(0).map(|module| {
-            module.inputs = vec![
-                graph::substreams::module::Input {
-                    input: Some(Input::Params(Params { value: "x".into() })),
-                },
-                graph::substreams::module::Input {
-                    input: Some(Input::Params(Params { value: "y".into() })),
-                },
-                graph::substreams::module::Input {
-                    input: Some(Input::Params(Params {
-                        value: "123".into(),
-                    })),
-                },
-            ]
+            module.inputs = vec![graph::substreams::module::Input {
+                input: Some(Input::Params(Params {
+                    value: "x\ny\n123".into(),
+                })),
+            }]
         });
         package.modules = Some(modules);
 

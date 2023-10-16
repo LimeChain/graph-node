@@ -1,10 +1,10 @@
 use crate::{
-    components::store::{DeploymentLocator, EntityKey, EntityType},
+    components::store::DeploymentLocator,
     data::graphql::ObjectTypeExt,
     prelude::{lazy_static, q, r, s, CacheWeight, QueryExecutionError},
     runtime::gas::{Gas, GasSizeOf},
-    schema::InputSchema,
-    util::intern::AtomPool,
+    schema::{EntityKey, EntityType, InputSchema},
+    util::intern::{self, AtomPool},
     util::intern::{Error as InternError, NullValue, Object},
 };
 use crate::{data::subgraph::DeploymentHash, prelude::EntityChange};
@@ -25,6 +25,10 @@ use super::{
     graphql::{ext::DirectiveFinder, TypeExt as _},
     value::Word,
 };
+
+/// Handling of entity ids
+mod id;
+pub use id::{Id, IdList, IdRef, IdType};
 
 /// Custom scalars in GraphQL.
 pub mod scalar;
@@ -55,7 +59,7 @@ impl SubscriptionFilter {
                     entity_type,
                     ..
                 },
-            ) => subgraph_id == eid && entity_type == etype,
+            ) => subgraph_id == eid && entity_type == etype.as_str(),
             (Self::Assignment, EntityChange::Assignment { .. }) => true,
             _ => false,
         }
@@ -173,13 +177,6 @@ impl ValueType {
     pub fn is_scalar(s: &str) -> bool {
         Self::from_str(s).is_ok()
     }
-}
-
-/// The types that can be used for the `id` of an entity
-#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
-pub enum IdType {
-    String,
-    Bytes,
 }
 
 // Note: Do not modify fields without also making a backward compatible change to the StableHash impl (below)
@@ -640,6 +637,16 @@ lazy_static! {
 #[derive(Clone, PartialEq, Eq, Serialize)]
 pub struct Entity(Object<Value>);
 
+impl<'a> IntoIterator for &'a Entity {
+    type Item = (Word, Value);
+
+    type IntoIter = intern::ObjectOwningIter<Value>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.0.clone().into_iter()
+    }
+}
+
 pub trait IntoEntityIterator: IntoIterator<Item = (Word, Value)> {}
 
 impl<T: IntoIterator<Item = (Word, Value)>> IntoEntityIterator for T {}
@@ -799,12 +806,8 @@ impl Entity {
     /// string. If it is `Bytes`, return it as a hex string with a `0x`
     /// prefix. If the ID is not set or anything but a `String` or `Bytes`,
     /// return an error
-    pub fn id(&self) -> Word {
-        match self.get("id") {
-            Some(Value::String(s)) => Word::from(s.clone()),
-            Some(Value::Bytes(b)) => Word::from(b.to_string()),
-            None | Some(_) => unreachable!("we checked the id when constructing this entity"),
-        }
+    pub fn id(&self) -> Id {
+        Id::try_from(self.get("id").unwrap().clone()).expect("the id is set to a valid value")
     }
 
     /// Merges an entity update `update` into this entity.
@@ -864,7 +867,7 @@ impl Entity {
                 s::Type::NamedType(name) => ValueType::from_str(name).unwrap_or_else(|_| {
                     match schema.get_named_type(name) {
                         Some(t::Object(obj_type)) => {
-                            let id = obj_type.field("id").expect("all object types have an id");
+                            let id = obj_type.field(&*ID).expect("all object types have an id");
                             scalar_value_type(schema, &id.field_type)
                         }
                         Some(t::Interface(intf)) => {
@@ -884,7 +887,7 @@ impl Entity {
                                 }
                                 Some(obj_type) => {
                                     let id =
-                                        obj_type.field("id").expect("all object types have an id");
+                                        obj_type.field(&*ID).expect("all object types have an id");
                                     scalar_value_type(schema, &id.field_type)
                                 }
                             }
@@ -908,7 +911,7 @@ impl Entity {
             return Ok(());
         }
 
-        let object_type = schema.find_object_type(&key.entity_type).ok_or_else(|| {
+        let object_type = key.entity_type.object_type().ok_or_else(|| {
             EntityValidationError::UnknownEntityType {
                 entity: key.entity_type.to_string(),
                 id: key.entity_id.to_string(),
@@ -916,9 +919,9 @@ impl Entity {
         })?;
 
         for field in self.0.atoms() {
-            if !schema.has_field(&key.entity_type, field) {
+            if !key.entity_type.has_field(field) {
                 return Err(EntityValidationError::FieldsNotDefined {
-                    entity: key.entity_type.clone().into_string(),
+                    entity: key.entity_type.to_string(),
                 });
             }
         }
@@ -1035,6 +1038,21 @@ impl std::fmt::Debug for Entity {
     }
 }
 
+/// An object that is returned from a query. It's a an `r::Value` which
+/// carries the attributes of the object (`__typename`, `id` etc.) and
+/// possibly a pointer to its parent if the query that constructed it is one
+/// that depends on parents
+pub struct QueryObject {
+    pub parent: Option<Id>,
+    pub entity: r::Object,
+}
+
+impl CacheWeight for QueryObject {
+    fn indirect_weight(&self) -> usize {
+        self.parent.indirect_weight() + self.entity.indirect_weight()
+    }
+}
+
 #[test]
 fn value_bytes() {
     let graphql_value = r::Value::String("0x8f494c66afc1d3f8ac1b45df21f02a46".to_owned());
@@ -1086,6 +1104,7 @@ fn entity_validation() {
         static ref SUBGRAPH: DeploymentHash = DeploymentHash::new("doesntmatter").unwrap();
         static ref SCHEMA: InputSchema =
             InputSchema::parse(DOCUMENT, SUBGRAPH.clone()).expect("Failed to parse test schema");
+        static ref THING_TYPE: EntityType = SCHEMA.entity_type("Thing").unwrap();
     }
 
     fn make_thing(name: &str) -> Entity {
@@ -1094,7 +1113,7 @@ fn entity_validation() {
 
     fn check(thing: Entity, errmsg: &str) {
         let id = thing.id();
-        let key = EntityKey::data("Thing".to_owned(), id.clone());
+        let key = THING_TYPE.key(id.clone());
 
         let err = thing.validate(&SCHEMA, &key);
         if errmsg.is_empty() {

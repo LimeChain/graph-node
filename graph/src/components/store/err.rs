@@ -1,7 +1,7 @@
-use super::{BlockNumber, DeploymentHash, DeploymentSchemaVersion};
-use crate::data::store::EntityValidationError;
+use super::{BlockNumber, DeploymentSchemaVersion};
 use crate::prelude::QueryExecutionError;
 use crate::util::intern::Error as InternError;
+use crate::{data::store::EntityValidationError, prelude::DeploymentHash};
 
 use anyhow::{anyhow, Error};
 use diesel::result::Error as DieselError;
@@ -29,6 +29,8 @@ pub enum StoreError {
     MalformedDirective(String),
     #[error("query execution failed: {0}")]
     QueryExecutionError(String),
+    #[error("Child filter nesting not supported by value `{0}`: `{1}`")]
+    ChildFilterNestingNotSupportedError(String, String),
     #[error("invalid identifier: {0}")]
     InvalidIdentifier(String),
     #[error(
@@ -73,10 +75,10 @@ pub enum StoreError {
 #[macro_export]
 macro_rules! constraint_violation {
     ($msg:expr) => {{
-        StoreError::ConstraintViolation(format!("{}", $msg))
+        $crate::prelude::StoreError::ConstraintViolation(format!("{}", $msg))
     }};
     ($fmt:expr, $($arg:tt)*) => {{
-        StoreError::ConstraintViolation(format!($fmt, $($arg)*))
+        $crate::prelude::StoreError::ConstraintViolation(format!($fmt, $($arg)*))
     }}
 }
 
@@ -98,6 +100,9 @@ impl Clone for StoreError {
             }
             Self::MalformedDirective(arg0) => Self::MalformedDirective(arg0.clone()),
             Self::QueryExecutionError(arg0) => Self::QueryExecutionError(arg0.clone()),
+            Self::ChildFilterNestingNotSupportedError(arg0, arg1) => {
+                Self::ChildFilterNestingNotSupportedError(arg0.clone(), arg1.clone())
+            }
             Self::InvalidIdentifier(arg0) => Self::InvalidIdentifier(arg0.clone()),
             Self::DuplicateBlockProcessing(arg0, arg1) => {
                 Self::DuplicateBlockProcessing(arg0.clone(), arg1.clone())
